@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, RateLimitError
@@ -13,6 +14,72 @@ from tqdm.asyncio import tqdm_asyncio
 from safety_refusals.cache import make_batch_key, load_batch, save_batch
 
 load_dotenv()
+
+_EXPONENTIAL_WAIT = wait_exponential(multiplier=2, min=4, max=60)
+
+
+def _seconds_until_retry(exc: BaseException) -> float | None:
+    """Read Retry-After / X-RateLimit-Reset from a 429, if present."""
+    headers: dict = {}
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers.update(dict(getattr(response, "headers", {}) or {}))
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        meta = (body.get("error") or {}).get("metadata") or {}
+        headers.update(meta.get("headers") or {})
+
+    lower = {str(k).lower(): v for k, v in headers.items()}
+    retry_after = lower.get("retry-after")
+    if retry_after is not None:
+        try:
+            return min(max(float(retry_after), 1.0), 120.0)
+        except (TypeError, ValueError):
+            pass
+
+    reset = lower.get("x-ratelimit-reset")
+    if reset is not None:
+        try:
+            ts = float(reset)
+            if ts > 1e12:
+                ts /= 1000.0
+            delay = ts - time.time()
+            if delay > 0:
+                return min(delay + 0.5, 120.0)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _wait_rate_limit(retry_state) -> float:
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if exc is not None:
+        delay = _seconds_until_retry(exc)
+        if delay is not None:
+            return delay
+    return _EXPONENTIAL_WAIT(retry_state)
+
+
+class AsyncRateLimiter:
+    """Sliding-window limiter: at most `rpm` starts per 60 seconds."""
+
+    def __init__(self, rpm: int | None):
+        self.rpm = rpm
+        self._started: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        if not self.rpm:
+            return
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._started = [t for t in self._started if now - t < 60.0]
+                if len(self._started) < self.rpm:
+                    self._started.append(now)
+                    return
+                sleep_for = 60.0 - (now - self._started[0]) + 0.05
+            await asyncio.sleep(max(sleep_for, 0.05))
 
 
 def get_openrouter_client() -> AsyncOpenAI:
@@ -38,8 +105,8 @@ def get_openai_client() -> AsyncOpenAI:
 
 @retry(
     retry=retry_if_exception_type((RateLimitError, APIConnectionError, APITimeoutError)),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
+    stop=stop_after_attempt(10),
+    wait=_wait_rate_limit,
 )
 async def call_api(
     client: AsyncOpenAI,
@@ -122,10 +189,13 @@ async def process_one(
     logprobs: bool = False,
     top_logprobs: int | None = None,
     extra_body: dict | None = None,
+    rate_limiter: AsyncRateLimiter | None = None,
     **kwargs,
 ):
     """Process a single request with semaphore-based concurrency control."""
     async with semaphore:
+        if rate_limiter is not None:
+            await rate_limiter.acquire()
         return await call_api(
             client=client,
             model=model,
@@ -155,6 +225,7 @@ async def process_batch(
     extra_body: dict | None = None,
     return_exceptions: bool = False,
     cache: bool = True,
+    requests_per_minute: int | None = None,
     **kwargs,
 ) -> list:
     """
@@ -174,6 +245,7 @@ async def process_batch(
         extra_body: Extra parameters to pass in request body (e.g., top_k for OpenRouter).
         return_exceptions: If True, exceptions are returned in results instead of raised.
         cache: If True, cache results in SQLite. Set False for ephemeral calls like summaries.
+        requests_per_minute: If set, start at most this many requests per rolling 60s window.
         **kwargs: Additional parameters forwarded to the API call (e.g., parallel_tool_calls, seed).
 
     Returns:
@@ -203,6 +275,7 @@ async def process_batch(
             return [ChatCompletion.model_validate(r) for r in cached]
 
     semaphore = asyncio.Semaphore(max_concurrent)
+    rate_limiter = AsyncRateLimiter(requests_per_minute)
     coroutines = [
         process_one(
             client=client,
@@ -216,6 +289,7 @@ async def process_batch(
             logprobs=logprobs,
             top_logprobs=top_logprobs,
             extra_body=extra_body,
+            rate_limiter=rate_limiter,
             **kwargs,
         )
         for m in messages_list
